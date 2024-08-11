@@ -1,0 +1,127 @@
+---
+# Copyright Red Hat
+# SPDX-License-Identifier: Apache-2.0
+#
+# This playbook can help in order to backup some Ceph files and restore them later.
+#
+# Usage:
+#
+# ansible-playbook -i <inventory> backup-and-restore-ceph-files.yml -e backup_dir=<backup directory path> -e mode=<backup|restore> -e target_node=<inventory_name>
+#
+# Required run-time variables
+# ------------------
+# backup_dir : a path where files will be read|write.
+# mode : tell the playbook either to backup or restore files.
+# target_node : the name of the node being processed, it must match the name set in the inventory.
+#
+# Examples
+# --------
+# ansible-playbook -i hosts, backup-and-restore-ceph-files.yml -e backup_dir=/usr/share/ceph-ansible/backup-ceph-files -e mode=backup -e target_node=mon01
+# ansible-playbook -i hosts, backup-and-restore-ceph-files.yml -e backup_dir=/usr/share/ceph-ansible/backup-ceph-files -e mode=restore -e target_node=mon01
+
+- hosts: localhost
+  become: true
+  gather_facts: true
+  tasks:
+    - name: exit playbook, if user did not set the source node
+      fail:
+        msg: >
+          "You must pass the node name: -e target_node=<inventory_name>.
+          The name must match what is set in your inventory."
+      when:
+        - target_node is not defined
+          or target_node not in groups.get('all', [])
+
+    - name: exit playbook, if user did not set the backup directory
+      fail:
+        msg: >
+          "you must pass the backup directory path: -e backup_dir=<backup directory path>"
+      when: backup_dir is not defined
+
+    - name: exit playbook, if user did not set the playbook mode (backup|restore)
+      fail:
+        msg: >
+          "you must pass the mode: -e mode=<backup|restore>"
+      when:
+        - mode is not defined
+          or mode not in ['backup', 'restore']
+
+    - name: gather facts on source node
+      setup:
+      delegate_to: "{{ target_node }}"
+      delegate_facts: true
+
+    - name: backup mode
+      when: mode == 'backup'
+      block:
+        - name: find files
+          find:
+            paths:
+              - /etc/ceph
+              - /var/lib/ceph
+            recurse: yes
+          register: file_to_backup
+          delegate_to: "{{ target_node }}"
+
+        - name: backup files
+          fetch:
+            src: "{{ item.path }}"
+            dest: "{{ backup_dir }}/{{ hostvars[target_node]['ansible_facts']['hostname'] }}/{{ item.path }}"
+            flat: yes
+          loop: "{{ file_to_backup.files }}"
+          delegate_to: "{{ target_node }}"
+
+        - name: preserve mode on files
+          file:
+            path: "{{ backup_dir }}/{{ hostvars[target_node]['ansible_facts']['hostname'] }}/{{ item.path }}"
+            mode: "{{ item.mode }}"
+            owner: "{{ item.uid }}"
+            group: "{{ item.gid }}"
+          loop: "{{ file_to_backup.files }}"
+
+    - name: restore mode
+      when: mode == 'restore'
+      block:
+        - name: stat directories
+          stat:
+            path: "{{ backup_dir }}/{{ hostvars[target_node]['ansible_facts']['hostname'] }}{{ item }}"
+          register: dir_stat
+          loop:
+            - /etc/ceph
+            - /var/lib/ceph
+
+        - name: get a list of files to be restored
+          find:
+            paths:
+              - "{{ backup_dir }}/{{ hostvars[target_node]['ansible_facts']['hostname'] }}"
+            recurse: yes
+          register: file_to_restore
+
+        - name: create a list of directories to create
+          set_fact:
+            dir_to_create: "{{ dir_to_create | default([]) | union([{'path': item.item | replace(backup_dir + '/' + hostvars[target_node]['ansible_facts']['hostname'], ''), 'uid': item.stat.uid, 'gid': item.stat.gid, 'mode': item.stat.mode}]) }}"
+          loop: "{{ dir_stat.results }}"
+          delegate_to: "{{ target_node }}"
+
+        - name: create a liste of sub-directories to create
+          set_fact:
+            subdir_to_create: "{{ subdir_to_create | default([]) | union([{'path': item.path | dirname | replace(backup_dir + '/' + hostvars[target_node]['ansible_facts']['hostname'], ''), 'uid': item.uid, 'gid': item.gid, 'mode': item.mode}]) }}"
+          loop: "{{ file_to_restore.files }}"
+
+        - name: ensure directories are created
+          file:
+            state: directory
+            path: "{{ item.path }}"
+            mode: "{{ item.mode }}"
+            owner: "{{ item.uid }}"
+            group: "{{ item.gid }}"
+          loop: "{{ dir_to_create + subdir_to_create }}"
+          delegate_to: "{{ target_node }}"
+
+        - name: restore files
+          copy:
+            src: "{{ item.path }}"
+            dest: "{{ item.path | replace(backup_dir + '/' + hostvars[target_node]['ansible_facts']['hostname'], '') }}"
+            mode: preserve
+          loop: "{{ file_to_restore.files }}"
+          delegate_to: "{{ target_node }}"

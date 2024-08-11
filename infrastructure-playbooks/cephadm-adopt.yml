@@ -249,11 +249,49 @@
       run_once: true
       delegate_to: '{{ groups[mon_group_name][0] }}'
 
-    - name: generate cephadm ssh key
-      command: "{{ ceph_cmd }} cephadm generate-key"
+    - name: check if there is an existing ssh keypair
+      stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ cephadm_ssh_priv_key_path }}"
+        - "{{ cephadm_ssh_pub_key_path }}"
+      register: ssh_keys
       changed_when: false
       run_once: true
       delegate_to: '{{ groups[mon_group_name][0] }}'
+
+    - name: set fact
+      set_fact:
+        stat_ssh_key_pair: "{{ ssh_keys.results | map(attribute='stat.exists') | list }}"
+
+    - name: fail if either ssh public or private key is missing
+      fail:
+        msg: "One part of the ssh keypair of user {{ cephadm_ssh_user }} is missing"
+      when:
+        - false in stat_ssh_key_pair
+        - true in stat_ssh_key_pair
+
+    - name: generate cephadm ssh key if there is none
+      command: "{{ ceph_cmd }} cephadm generate-key"
+      when: not true in stat_ssh_key_pair
+      changed_when: false
+      run_once: true
+      delegate_to: '{{ groups[mon_group_name][0] }}'
+
+    - name: use existing user keypair for remote connections
+      when: not false in stat_ssh_key_pair
+      delegate_to: "{{ groups[mon_group_name][0] }}"
+      run_once: true
+      command: >
+        {{ container_binary + ' run --rm --net=host --security-opt label=disable
+        -v /etc/ceph:/etc/ceph:z
+        -v /var/lib/ceph:/var/lib/ceph:ro
+        -v /var/run/ceph:/var/run/ceph:z
+        -v ' + item.1 + ':/etc/ceph/cephadm.' + item.0 + ':ro --entrypoint=ceph '+ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else 'ceph' }}
+        --cluster {{ cluster }} cephadm set-{{ item.0 }}-key -i /etc/ceph/cephadm.{{ item.0 }}
+      with_together:
+        - [ 'pub', 'priv' ]
+        - [ '{{ cephadm_ssh_pub_key_path }}', '{{ cephadm_ssh_priv_key_path }}' ]
 
     - name: get the cephadm ssh pub key
       command: "{{ ceph_cmd }} cephadm get-pub-key"
@@ -262,13 +300,13 @@
       register: cephadm_pubpkey
       delegate_to: '{{ groups[mon_group_name][0] }}'
 
-    - name: allow cephadm key for {{ cephadm_ssh_user | default('root') }} account
+    - name: allow cephadm key for {{ cephadm_ssh_user }} account
       authorized_key:
-        user: "{{ cephadm_ssh_user | default('root') }}"
+        user: "{{ cephadm_ssh_user }}"
         key: '{{ cephadm_pubpkey.stdout }}'
 
-    - name: set cephadm ssh user to {{ cephadm_ssh_user | default('root') }}
-      command: "{{ ceph_cmd }} cephadm set-user {{ cephadm_ssh_user | default('root') }}"
+    - name: set cephadm ssh user to {{ cephadm_ssh_user }}
+      command: "{{ ceph_cmd }} cephadm set-user {{ cephadm_ssh_user }}"
       changed_when: false
       run_once: true
       delegate_to: "{{ groups[mon_group_name][0] }}"
@@ -322,14 +360,22 @@
       delegate_to: '{{ groups[mon_group_name][0] }}'
       when: is_hci | bool
 
+    - name: set autotune_memory_target_ratio
+      command: "{{ ceph_cmd }} config set mgr mgr/cephadm/autotune_memory_target_ratio {{ '0.2' if is_hci | bool else '0.7' }}"
+      changed_when: false
+      delegate_to: "{{ groups[mon_group_name][0] }}"
+      run_once: true
+      environment:
+        CEPHADM_IMAGE: '{{ ceph_docker_registry }}/{{ ceph_docker_image }}:{{ ceph_docker_image_tag }}'
+
     - name: manage nodes with cephadm - ipv4
-      command: "{{ ceph_cmd }} orch host add {{ ansible_facts['nodename'] }} {{ ansible_facts['all_ipv4_addresses'] | ips_in_ranges(public_network.split(',')) | first }} {{ group_names | join(' ') }}"
+      command: "{{ ceph_cmd }} orch host add {{ ansible_facts['nodename'] }} {{ ansible_facts['all_ipv4_addresses'] | ips_in_ranges(cephadm_mgmt_network.split(',')) | first }} {{ group_names | intersect(adopt_label_group_names) | join(' ') }}"
       changed_when: false
       delegate_to: '{{ groups[mon_group_name][0] }}'
       when: ip_version == 'ipv4'
 
     - name: manage nodes with cephadm - ipv6
-      command: "{{ ceph_cmd }} orch host add {{ ansible_facts['nodename'] }} {{ ansible_facts['all_ipv6_addresses'] | ips_in_ranges(public_network.split(',')) | last | ipwrap }} {{ group_names | join(' ') }}"
+      command: "{{ ceph_cmd }} orch host add {{ ansible_facts['nodename'] }} {{ ansible_facts['all_ipv6_addresses'] | ips_in_ranges(cephadm_mgmt_network.split(',')) | last | ansible.utils.ipwrap }} {{ group_names | intersect(adopt_label_group_names) | join(' ') }}"
       changed_when: false
       delegate_to: '{{ groups[mon_group_name][0] }}'
       when: ip_version == 'ipv6'
@@ -457,7 +503,7 @@
               register: remote_user_keyring
 
             - name: get quorum_status
-              command: "{{ ceph_cmd }} quorum_status --format json"
+              command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph quorum_status --format json"
               changed_when: false
               delegate_to: "{{ groups[mon_group_name][0] }}"
               register: quorum_status
@@ -543,7 +589,7 @@
         - /etc/systemd/system/ceph-mon.target
 
     - name: waiting for the monitor to join the quorum...
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} quorum_status --format json"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph quorum_status --format json"
       changed_when: false
       register: ceph_health_raw
       until: >
@@ -640,7 +686,7 @@
         name: ceph-defaults
 
     - name: update the placement of iscsigw hosts
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch apply iscsi {{ iscsi_pool_name | default('rbd') }} {{ api_user | default('admin') }} {{ api_password | default('admin') }} {{ trusted_ip_list | default('192.168.122.1') }} --placement='{{ groups.get(iscsi_gw_group_name, []) | length }} label:{{ iscsi_gw_group_name }}'"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch apply iscsi {{ iscsi_pool_name | default('rbd') }} {{ api_user | default('admin') }} {{ api_password | default('admin') }} {{ trusted_ip_list | default('192.168.122.1') }} --placement='{{ groups.get(iscsi_gw_group_name, []) | length }} label:{{ iscsi_gw_group_name }}'"
       run_once: true
       changed_when: false
       delegate_to: '{{ groups[mon_group_name][0] }}'
@@ -787,8 +833,13 @@
         state: absent
       loop: '{{ (osd_list.stdout | from_json).keys() | list }}'
 
+    - name: remove any legacy directories in /var/lib/ceph/mon (workaround)
+      file:
+        path: "/var/lib/ceph/mon/{{ cluster }}-{{ ansible_facts['hostname'] }}"
+        state: absent
+
     - name: waiting for clean pgs...
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} pg stat --format json"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph pg stat --format json"
       changed_when: false
       register: ceph_health_post
       until: >
@@ -863,7 +914,7 @@
         name: ceph-defaults
 
     - name: update the placement of metadata hosts
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch apply mds {{ cephfs }} --placement='{{ groups.get(mds_group_name, []) | length }} label:{{ mds_group_name }}'"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch apply mds {{ cephfs }} --placement='{{ groups.get(mds_group_name, []) | length }} label:{{ mds_group_name }}'"
       run_once: true
       changed_when: false
       delegate_to: "{{ groups[mon_group_name][0] }}"
@@ -964,7 +1015,7 @@
 
     - name: update the placement of radosgw hosts
       command: >
-        {{ cephadm_cmd }} shell --fsid {{ fsid }} --
+        {{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} --
         ceph --cluster {{ cluster }} orch apply rgw {{ ansible_facts['hostname'] }}
         --placement='count-per-host:{{ radosgw_num_instances }} {{ ansible_facts['nodename'] }}'
         --port={{ radosgw_frontend_port }}
@@ -977,7 +1028,7 @@
 
     - name: update the placement of radosgw multisite hosts
       command: >
-        {{ cephadm_cmd }} shell --fsid {{ fsid }} --
+        {{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} --
         ceph --cluster {{ cluster }} orch apply rgw {{ ansible_facts['hostname'] }}.{{ item.rgw_realm }}.{{ item.rgw_zone }}.{{ item.radosgw_frontend_port }}
         --placement={{ ansible_facts['nodename'] }}
         --realm={{ item.rgw_realm }} --zone={{ item.rgw_zone }}
@@ -1098,14 +1149,14 @@
         state: absent
 
     - name: create nfs ganesha cluster
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} nfs cluster create {{ ansible_facts['hostname'] }} {{ ansible_facts['hostname'] }}"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph nfs cluster create {{ ansible_facts['hostname'] }} {{ ansible_facts['hostname'] }}"
       changed_when: false
       delegate_to: "{{ groups[mon_group_name][0] }}"
       environment:
         CEPHADM_IMAGE: '{{ ceph_docker_registry }}/{{ ceph_docker_image }}:{{ ceph_docker_image_tag }}'
 
     - name: create cephfs export
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} nfs export create cephfs {{ cephfs }} {{ ansible_facts['hostname'] }} {{ ceph_nfs_ceph_pseudo_path }} --squash {{ ceph_nfs_ceph_squash }}"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph nfs export create cephfs {{ cephfs }} {{ ansible_facts['hostname'] }} {{ ceph_nfs_ceph_pseudo_path }} --squash {{ ceph_nfs_ceph_squash }}"
       changed_when: false
       delegate_to: "{{ groups[mon_group_name][0] }}"
       environment:
@@ -1113,7 +1164,7 @@
       when: nfs_file_gw | bool
 
     - name: create rgw export
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} nfs export create rgw --cluster-id {{ ansible_facts['hostname'] }} --pseudo-path {{ ceph_nfs_rgw_pseudo_path }} --user-id {{ ceph_nfs_rgw_user }} --squash {{ ceph_nfs_rgw_squash }}"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph nfs export create rgw --cluster-id {{ ansible_facts['hostname'] }} --pseudo-path {{ ceph_nfs_rgw_pseudo_path }} --user-id {{ ceph_nfs_rgw_user }} --squash {{ ceph_nfs_rgw_squash }}"
       changed_when: false
       delegate_to: "{{ groups[mon_group_name][0] }}"
       environment:
@@ -1130,7 +1181,7 @@
         name: ceph-defaults
 
     - name: update the placement of rbd-mirror hosts
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch apply rbd-mirror --placement='{{ groups.get(rbdmirror_group_name, []) | length }} label:{{ rbdmirror_group_name }}'"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch apply rbd-mirror --placement='{{ groups.get(rbdmirror_group_name, []) | length }} label:{{ rbdmirror_group_name }}'"
       run_once: true
       changed_when: false
       delegate_to: "{{ groups[mon_group_name][0] }}"
@@ -1205,7 +1256,7 @@
         state: absent
 
     - name: update the placement of ceph-crash hosts
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch apply crash --placement='label:ceph'"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch apply crash --placement='label:ceph'"
       run_once: true
       changed_when: false
       delegate_to: '{{ groups[mon_group_name][0] }}'
@@ -1414,7 +1465,7 @@
             state: absent
 
         - name: update the placement of node-exporter hosts
-          command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch apply node-exporter --placement='*'"
+          command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch apply node-exporter --placement='*'"
           run_once: true
           changed_when: false
           delegate_to: '{{ groups[mon_group_name][0] }}'
@@ -1432,7 +1483,7 @@
         name: ceph-defaults
 
     - name: update the placement of monitor hosts
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch apply mon --placement='{{ groups.get(mon_group_name, []) | length }} label:{{ mon_group_name }}'"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch apply mon --placement='{{ groups.get(mon_group_name, []) | length }} label:{{ mon_group_name }}'"
       changed_when: false
       environment:
         CEPHADM_IMAGE: '{{ ceph_docker_registry }}/{{ ceph_docker_image }}:{{ ceph_docker_image_tag }}'
@@ -1446,7 +1497,7 @@
         mgr_placement_label: "{{ mgr_group_name if groups.get(mgr_group_name, []) | length > 0 else mon_group_name }}"
 
     - name: update the placement of manager hosts
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch apply mgr --placement='{{ mgr_placement_count }} label:{{ mgr_placement_label }}'"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch apply mgr --placement='{{ mgr_placement_count }} label:{{ mgr_placement_label }}'"
       changed_when: false
       environment:
         CEPHADM_IMAGE: '{{ ceph_docker_registry }}/{{ ceph_docker_image }}:{{ ceph_docker_image_tag }}'
@@ -1455,19 +1506,19 @@
       when: dashboard_enabled | bool
       block:
         - name: update the placement of alertmanager hosts
-          command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch apply alertmanager --placement='{{ groups.get(monitoring_group_name, []) | length }} label:{{ monitoring_group_name }}'"
+          command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch apply alertmanager --placement='{{ groups.get(monitoring_group_name, []) | length }} label:{{ monitoring_group_name }}'"
           changed_when: false
           environment:
             CEPHADM_IMAGE: '{{ ceph_docker_registry }}/{{ ceph_docker_image }}:{{ ceph_docker_image_tag }}'
 
         - name: update the placement of grafana hosts
-          command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch apply grafana --placement='{{ groups.get(monitoring_group_name, []) | length }} label:{{ monitoring_group_name }}'"
+          command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch apply grafana --placement='{{ groups.get(monitoring_group_name, []) | length }} label:{{ monitoring_group_name }}'"
           changed_when: false
           environment:
             CEPHADM_IMAGE: '{{ ceph_docker_registry }}/{{ ceph_docker_image }}:{{ ceph_docker_image_tag }}'
 
         - name: update the placement of prometheus hosts
-          command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch apply prometheus --placement='{{ groups.get(monitoring_group_name, []) | length }} label:{{ monitoring_group_name }}'"
+          command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch apply prometheus --placement='{{ groups.get(monitoring_group_name, []) | length }} label:{{ monitoring_group_name }}'"
           changed_when: false
           environment:
             CEPHADM_IMAGE: '{{ ceph_docker_registry }}/{{ ceph_docker_image }}:{{ ceph_docker_image_tag }}'
@@ -1482,13 +1533,13 @@
         name: ceph-defaults
 
     - name: show ceph orchestrator services
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch ls --refresh"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch ls --refresh"
       changed_when: false
       environment:
         CEPHADM_IMAGE: '{{ ceph_docker_registry }}/{{ ceph_docker_image }}:{{ ceph_docker_image_tag }}'
 
     - name: show ceph orchestrator daemons
-      command: "{{ cephadm_cmd }} shell --fsid {{ fsid }} -- ceph --cluster {{ cluster }} orch ps --refresh"
+      command: "{{ cephadm_cmd }} shell -k /etc/ceph/{{ cluster }}.client.admin.keyring --fsid {{ fsid }} -- ceph orch ps --refresh"
       changed_when: false
       environment:
         CEPHADM_IMAGE: '{{ ceph_docker_registry }}/{{ ceph_docker_image }}:{{ ceph_docker_image_tag }}'

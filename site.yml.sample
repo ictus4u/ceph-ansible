@@ -1,6 +1,16 @@
 ---
 # Defines deployment design and assigns role to server groups
 
+- hosts: localhost
+  connection: local
+  tasks:
+    - name: Warn about ceph-ansible current status
+      fail:
+        msg: "cephadm is the new official installer. Please, consider migrating.
+              See https://docs.ceph.com/en/latest/cephadm/install for new deployments
+              or https://docs.ceph.com/en/latest/cephadm/adoption for migrating existing deployments."
+      when: not yes_i_know | default(false) | bool
+
 - hosts:
   - mons
   - osds

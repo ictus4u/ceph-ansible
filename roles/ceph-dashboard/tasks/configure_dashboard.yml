@@ -10,13 +10,19 @@
 
 - name: get current mgr backend - ipv4
   set_fact:
-    dashboard_server_addr: "{{ ansible_facts['all_ipv4_addresses'] | ips_in_ranges(dashboard_network.split(',')) | first }}"
+    dashboard_server_addr: "{{ hostvars[item]['ansible_facts']['all_ipv4_addresses'] | ips_in_ranges(dashboard_network.split(',')) | first }}"
   when: ip_version == 'ipv4'
+  loop: "{{ groups.get(mgr_group_name) if groups.get(mgr_group_name, []) | length > 0 else groups.get(mon_group_name) }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: True
 
 - name: get current mgr backend - ipv6
   set_fact:
-    dashboard_server_addr: "{{ ansible_facts['all_ipv6_addresses'] | ips_in_ranges(dashboard_network.split(',')) | last }}"
+    dashboard_server_addr: "{{ hostvars[item]['ansible_facts']['all_ipv6_addresses'] | ips_in_ranges(dashboard_network.split(',')) | last }}"
   when: ip_version == 'ipv6'
+  loop: "{{ groups.get(mgr_group_name) if groups.get(mgr_group_name, []) | length > 0 else groups.get(mon_group_name) }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: True
 
 - name: disable SSL for dashboard
   when: dashboard_protocol == "http"
@@ -306,7 +312,7 @@
     - name: add iscsi gateways - ipv6
       command: "{{ ceph_cmd }} --cluster {{ cluster }} dashboard iscsi-gateway-add -i -"
       args:
-        stdin: "{{ 'https' if hostvars[item]['api_secure'] | default(false) | bool else 'http' }}://{{ hostvars[item]['api_user'] | default('admin') }}:{{ hostvars[item]['api_password'] | default('admin') }}@{{ hostvars[item]['ansible_facts']['all_ipv6_addresses'] | ips_in_ranges(igw_network.split(',')) | last | ipwrap }}:{{ hostvars[item]['api_port'] | default(5000) }}"
+        stdin: "{{ 'https' if hostvars[item]['api_secure'] | default(false) | bool else 'http' }}://{{ hostvars[item]['api_user'] | default('admin') }}:{{ hostvars[item]['api_password'] | default('admin') }}@{{ hostvars[item]['ansible_facts']['all_ipv6_addresses'] | ips_in_ranges(igw_network.split(',')) | last | ansible.utils.ipwrap }}:{{ hostvars[item]['api_port'] | default(5000) }}"
         stdin_add_newline: no
       changed_when: false
       delegate_to: "{{ groups[mon_group_name][0] }}"
